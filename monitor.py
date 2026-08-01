@@ -10,11 +10,11 @@ EMAIL_TO = os.environ["EMAIL_TO"]
 URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
 
 WORDS = [
-    "nordic",
-    "danish",
-    "denmark",
-    "dk",
-    "iso"
+    "Nordic",
+    "Danish",
+    "ISO Nordic",
+    "ANSI",
+    "ISO"
 ]
 
 
