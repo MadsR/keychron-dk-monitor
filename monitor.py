@@ -1,6 +1,11 @@
 import requests
 import smtplib
 from email.message import EmailMessage
+import os
+
+EMAIL_FROM = os.environ["EMAIL_FROM"]
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+EMAIL_TO = os.environ["EMAIL_TO"]
 
 URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
 
