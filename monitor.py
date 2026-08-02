@@ -23,25 +23,25 @@ from email.message import EmailMessage
 # Configure logging early
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Email config (still read from env)
+# Email config (from env)
 EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
 # === CONSTANTS ===
-# Set the product URL you want to monitor here (constant, not env)
-PRODUCT_URL = "https://www.keychron.com/products/keychron-v1-qmk-custom-mechanical-keyboard-iso-layout-collection?variant=40283343487065"
+# Monitor the K5 Ultra product URL
+PRODUCT_URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
 
-# Set how many consecutive positive checks are required before notifying
-CONFIRMATIONS = 2
+# How many consecutive positive checks are required before notifying (set to 1 for immediate testing)
+CONFIRMATIONS = 1
 
-# Last state file name (kept as env or constant)
-LAST_STATE_FILE = os.environ.get("LAST_STATE_FILE", "last_state.json")
+# Last state file name
+LAST_STATE_FILE = "last_state.json"
 
 # Keywords to detect Nordic
 KEYWORDS = ["nordic", "danish", "iso nordic", "danish layout", "iso"]
 
-# Whether the script should exit non-zero on unexpected errors (still env-controlled)
+# Whether the script should exit non-zero on unexpected errors (env-controlled)
 FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
 # === end CONSTANTS ===
 
@@ -54,7 +54,7 @@ def make_session_with_retries(retries: int = 4, backoff_factor: float = 1.0, tim
         read=retries,
         status=retries,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "GET"],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
         backoff_factor=backoff_factor,
         raise_on_status=False,
     )
@@ -154,7 +154,6 @@ def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[st
         return _search_keywords_in_text(html_text, keywords)
     soup = BeautifulSoup(html_text, "lxml")
 
-    # 1) Check select/options
     for select in soup.find_all("select"):
         name = (select.get("name") or select.get("id") or "").lower()
         if "layout" in name or "keyboard" in name or "variant" in name or "option" in name:
@@ -163,20 +162,17 @@ def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[st
                 if text and _search_keywords_in_text(text, keywords):
                     return f"select:{name}:{text}"
 
-    # 2) Labels/radios
     for label in soup.find_all("label"):
         text = (label.get_text(" ", strip=True) or "")
         if text and _search_keywords_in_text(text, keywords):
             return f"label:{text[:100]}"
 
-    # 3) JSON-LD
     ld, src = parse_json_ld(soup)
     if ld:
         fk = inspect_product_json(ld, keywords)
         if fk:
             return f"{src}:{fk}"
 
-    # 4) body text fallback
     page_text = soup.get_text(" ", strip=True)[:200000]
     fk = _search_keywords_in_text(page_text, keywords)
     if fk:
@@ -221,13 +217,13 @@ def detect_nordic_layout(session: requests.Session, url: str, keywords: List[str
 
 def load_last_state(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        return {"found": False, "consecutive": 0, "evidence": None, "updated_at": None}
+        return {"found": False, "consecutive": 0, "evidence": [], "updated_at": None}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         logging.warning("Failed to read last state file, starting fresh: %s", path)
-        return {"found": False, "consecutive": 0, "evidence": None, "updated_at": None}
+        return {"found": False, "consecutive": 0, "evidence": [], "updated_at": None}
 
 
 def save_last_state(path: str, state: Dict[str, Any]) -> None:
@@ -248,24 +244,24 @@ def send_mail(subject: str, body: str) -> bool:
     msg["To"] = EMAIL_TO
     msg.set_content(body)
     try:
+        logging.info("Attempting to send email to %s", EMAIL_TO)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_FROM, EMAIL_PASSWORD)
             smtp.send_message(msg)
         logging.info("Notification email sent to %s", EMAIL_TO)
         return True
     except Exception as e:
-        logging.error("Failed to send email: %s", e, exc_info=False)
+        logging.error("Failed to send email: %s", e, exc_info=True)
         return False
 
 
 def run_check() -> int:
     session = make_session_with_retries()
-    urls_to_check = [PRODUCT_URL]  # constants only; retailer pages can be added in the file if desired
+    urls_to_check = [PRODUCT_URL]
 
     overall_found = False
     evidence_items: List[str] = []
 
-    # Skip empty urls defensively
     for u in urls_to_check:
         if not u or str(u).strip() == "":
             logging.debug("Skipping empty URL entry")
@@ -293,7 +289,7 @@ def run_check() -> int:
 
     if overall_found and new_consecutive >= CONFIRMATIONS and not prev_found:
         notify = True
-        subject = "Keychron — Nordic layout detected"
+        subject = "Keychron K5 Ultra — Nordic layout detected"
         body = f"Detected Nordic/Danish layout on {PRODUCT_URL}\n\nEvidence:\n" + "\n".join(evidence_items) + f"\n\nConfirmed {new_consecutive} consecutive times.\n\nTime: {now}"
         state["found"] = True
         state["consecutive"] = new_consecutive
@@ -301,7 +297,7 @@ def run_check() -> int:
         state["updated_at"] = now
     elif not overall_found and prev_found:
         notify = True
-        subject = "Keychron — Nordic layout no longer detected"
+        subject = "Keychron K5 Ultra — Nordic layout no longer detected"
         body = f"Previously-detected Nordic layout is no longer present on {PRODUCT_URL}\n\nChecked pages and found no evidence.\n\nTime: {now}"
         state["found"] = False
         state["consecutive"] = 0
