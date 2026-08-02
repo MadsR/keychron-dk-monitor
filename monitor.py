@@ -2,7 +2,6 @@
 import os
 import sys
 import json
-import time
 import logging
 from datetime import datetime
 from typing import Tuple, Optional, Dict, Any, List
@@ -12,54 +11,52 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Optional: BeautifulSoup is used for HTML parsing. Add to requirements: beautifulsoup4, lxml
+# HTML parsing
 try:
     from bs4 import BeautifulSoup
 except Exception:
-    BeautifulSoup = None  # we'll handle missing dependency gracefully
+    BeautifulSoup = None
 
 import smtplib
 from email.message import EmailMessage
+
+# Configure logging early so parsing warnings are visible
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Configuration from environment
 EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
-# Main product URL to check (the original product page)
+# Main product URL to check
 PRODUCT_URL = os.environ.get(
     "PRODUCT_URL",
     "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
 )
 
-# Optional list of retailer product pages to check as well (comma-separated env var)
-RETAILER_PAGES = [
-    u.strip() for u in os.environ.get("RETAILER_PAGES", "").split(",") if u.strip()
-]
+# Optional retailer pages (comma-separated)
+RETAILER_PAGES = [u.strip() for u in os.environ.get("RETAILER_PAGES", "").split(",") if u.strip()]
 
-# How many consecutive positive runs are required before sending a notification
-# Robustly parse CONFIRMATIONS - it may be unset or an empty string from workflow secrets
+# How many consecutive positive runs are required before sending a notification.
+# Parse CONFIRMATIONS defensively: treat missing/empty/non-int as default 2.
 _conf = os.environ.get("CONFIRMATIONS")
 try:
     if _conf is None or str(_conf).strip() == "":
         CONSECUTIVE_REQUIRED = 2
     else:
         CONSECUTIVE_REQUIRED = int(_conf)
-except ValueError:
+except Exception:
     logging.warning("Invalid CONFIRMATIONS value %r; using default 2", _conf)
     CONSECUTIVE_REQUIRED = 2
 
 # Whether the script should exit non-zero on unexpected errors
 FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
 
-# File to persist last-known state (written into workflow workspace)
+# Last state file name
 LAST_STATE_FILE = os.environ.get("LAST_STATE_FILE", "last_state.json")
 
-# Keywords to detect Nordic (case-insensitive)
+# Keywords to detect Nordic
 KEYWORDS = ["nordic", "danish", "iso nordic", "danish layout", "iso"]
-
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def make_session_with_retries(retries: int = 4, backoff_factor: float = 1.0, timeout: int = 20) -> requests.Session:
@@ -108,7 +105,6 @@ def _search_keywords_in_text(text: str, keywords: List[str]) -> Optional[str]:
 
 
 def try_product_json_endpoints(session: requests.Session, url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    # Common patterns: append .json or index.json (works for some stores like Shopify)
     candidates = [url + ".json", urljoin(url, "index.json"), urljoin(url, ".json")]
     for c in candidates:
         try:
@@ -125,13 +121,10 @@ def try_product_json_endpoints(session: requests.Session, url: str) -> Tuple[Opt
 
 
 def _recursive_search_for_keywords(obj: Any, keywords: List[str]) -> Optional[str]:
-    # Walk dicts/lists/strings recursively to find keywords; return the first matching snippet
     if isinstance(obj, str):
-        found = _search_keywords_in_text(obj, keywords)
-        return found
+        return _search_keywords_in_text(obj, keywords)
     if isinstance(obj, dict):
         for k, v in obj.items():
-            # check key and value (string keys may contain 'layout' etc)
             if isinstance(k, str):
                 fk = _search_keywords_in_text(k, keywords)
                 if fk:
@@ -148,11 +141,8 @@ def _recursive_search_for_keywords(obj: Any, keywords: List[str]) -> Optional[st
 
 
 def inspect_product_json(payload: Any, keywords: List[str]) -> Optional[str]:
-    # Look for variant/option names and values and arbitrary strings containing keywords
     if not payload:
         return None
-    # Many product JSONs put data under product, product->variants/options, or are the product object directly.
-    # Use recursive search to be generic.
     return _recursive_search_for_keywords(payload, keywords)
 
 
@@ -174,79 +164,67 @@ def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[st
     if not html_text:
         return None
     if BeautifulSoup is None:
-        # Fallback to plain text search if BeautifulSoup isn't installed
         return _search_keywords_in_text(html_text, keywords)
     soup = BeautifulSoup(html_text, "lxml")
-    # 1) Look at select/options (common for variant selections)
+
     for select in soup.find_all("select"):
-        name = (select.get("name") or select.get("id") or "") .lower()
-        # if select name or nearby label contains 'layout' or 'variant'
+        name = (select.get("name") or select.get("id") or "").lower()
         if "layout" in name or "keyboard" in name or "variant" in name or "option" in name:
             for option in select.find_all("option"):
                 text = (option.text or "").strip()
                 if text and _search_keywords_in_text(text, keywords):
                     return f"select:{name}:{text}"
-    # 2) Look for radio/label groups
+
     for label in soup.find_all("label"):
         text = (label.get_text(" ", strip=True) or "")
         if text and _search_keywords_in_text(text, keywords):
             return f"label:{text[:100]}"
-    # 3) JSON-LD
+
     ld, src = parse_json_ld(soup)
     if ld:
         fk = inspect_product_json(ld, keywords)
         if fk:
             return f"{src}:{fk}"
-    # 4) Fallback: page text search
-    page_text = soup.get_text(" ", strip=True)[:200000]  # cap
+
+    page_text = soup.get_text(" ", strip=True)[:200000]
     fk = _search_keywords_in_text(page_text, keywords)
     if fk:
         return f"body:{fk}"
+
     return None
 
 
 def detect_nordic_layout(session: requests.Session, url: str, keywords: List[str]) -> Tuple[bool, str]:
-    """
-    Try multiple strategies to detect presence of Nordic/Danish/ISO layout.
-    Returns (found, evidence_string).
-    """
-    # 0) quick fetch (with retries inside session)
     resp = safe_get(session, url)
     if resp is None:
         return False, f"fetch-failed:{url}"
 
-    # 1) product JSON endpoints
     payload, src = try_product_json_endpoints(session, url)
     if payload:
         match = inspect_product_json(payload, keywords)
         if match:
             return True, f"{src}:{match}"
 
-    # 2) JSON-LD and HTML parsing
     html = resp.text
     if BeautifulSoup:
         soup = BeautifulSoup(html, "lxml")
     else:
         soup = None
 
-    # JSON-LD
     ld, ld_src = parse_json_ld(soup)
     if ld:
         match = inspect_product_json(ld, keywords)
         if match:
             return True, f"{ld_src}:{match}"
 
-    # HTML selects/options, labels, page text
     match = inspect_html_for_layouts(html, keywords)
     if match:
         return True, f"html:{match}"
 
-    # 3) Fallback: attempt to find keywords in raw text
     fk = _search_keywords_in_text(html, keywords)
     if fk:
         return True, f"raw_body:{fk}"
 
-    # If nothing found
     return False, "no-evidence"
 
 
@@ -303,18 +281,15 @@ def run_check() -> int:
             overall_found = True
             evidence_items.append(f"{u} -> {evidence}")
 
-    # Load and update state
     state = load_last_state(LAST_STATE_FILE)
     prev_found = bool(state.get("found"))
     prev_consecutive = int(state.get("consecutive", 0))
 
-    # Determine new consecutive count
     if overall_found:
         new_consecutive = prev_consecutive + 1
     else:
         new_consecutive = 0
 
-    # Action: only notify when we've reached the confirmation threshold and previously it wasn't confirmed
     notify = False
     subject = ""
     body = ""
@@ -329,7 +304,6 @@ def run_check() -> int:
         state["evidence"] = evidence_items
         state["updated_at"] = now
     elif not overall_found and prev_found:
-        # We previously had a confirmed availability but it's gone now; notify once
         notify = True
         subject = "Keychron K5 Ultra — Nordic layout no longer detected"
         body = f"Previously-detected Nordic layout is no longer present on {PRODUCT_URL}\n\nChecked pages and found no evidence.\n\nTime: {now}"
@@ -338,11 +312,9 @@ def run_check() -> int:
         state["evidence"] = evidence_items
         state["updated_at"] = now
     else:
-        # update consecutive count but do not notify
         state["consecutive"] = new_consecutive
         state["evidence"] = evidence_items
         state["updated_at"] = now
-        # keep state['found'] unchanged unless we crossed threshold above
 
     save_last_state(LAST_STATE_FILE, state)
 
@@ -352,16 +324,13 @@ def run_check() -> int:
             logging.error("Failed to send notification and FAIL_ON_ERROR is set.")
             return 1
 
-    # Do not fail the run on transient fetch errors; return 0 normally.
     return 0
 
 
 if __name__ == "__main__":
     try:
         if BeautifulSoup is None:
-            logging.warning(
-                "BeautifulSoup is not installed. Install beautifulsoup4 and lxml for best detection results."
-            )
+            logging.warning("BeautifulSoup is not installed. Install beautifulsoup4 and lxml for best detection results.")
         exit_code = run_check()
         sys.exit(exit_code)
     except Exception as e:
@@ -370,4 +339,3 @@ if __name__ == "__main__":
             sys.exit(1)
         else:
             sys.exit(0)
-
