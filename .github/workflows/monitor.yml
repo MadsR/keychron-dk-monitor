@@ -1,43 +1,54 @@
 name: Keychron monitor
 
 on:
-
   schedule:
     - cron: "0 7 * * *"
-
   workflow_dispatch:
 
-
 jobs:
-
   check:
-
     runs-on: ubuntu-latest
 
-
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
+      - name: Download last_state.json (if available)
+        uses: actions/download-artifact@v4
+        with:
+          name: last_state
+          path: .
+        continue-on-error: true
 
-    - uses: actions/setup-python@v5
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      with:
-        python-version: "3.12"
+      - name: Run monitor
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          PRODUCT_URL: ${{ secrets.PRODUCT_URL }}     # optional: set in secrets for testing
+          CONFIRMATIONS: ${{ secrets.CONFIRMATIONS }} # optional: set to "1" for testing
+          LAST_STATE_FILE: last_state.json
+        run: |
+          python monitor.py
 
+      - name: Ensure last_state.json exists for artifact upload
+        run: |
+          if [ ! -f last_state.json ]; then
+            echo '{"found": false, "consecutive": 0, "evidence": [], "updated_at": null}' > last_state.json
+          fi
 
-    - run: pip install -r requirements.txt
-
-
-    - run: python monitor.py
-
-      env:
-
-        EMAIL_FROM:
-          ${{ secrets.EMAIL_FROM }}
-
-        EMAIL_PASSWORD:
-          ${{ secrets.EMAIL_PASSWORD }}
-
-        EMAIL_TO:
-          ${{ secrets.EMAIL_TO }}
+      - name: Upload last_state.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: last_state
+          path: last_state.json
