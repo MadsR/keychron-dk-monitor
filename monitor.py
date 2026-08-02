@@ -3,7 +3,7 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any, List
 from urllib.parse import urljoin
 
@@ -23,27 +23,28 @@ from email.message import EmailMessage
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Email config (from env)
+# === CONFIGURATION / CONSTANTS ===
+# Product to monitor (K5 Ultra)
+PRODUCT_URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
+
+# How many consecutive confirmations required to notify (2 is safer; set to 1 for testing)
+CONFIRMATIONS = 2
+
+# Persisted state filename (workflow uploads/downloads this artifact)
+LAST_STATE_FILE = "last_state.json"
+
+# Email configuration is read from secrets/environment:
 EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
-# === CONSTANTS ===
-PRODUCT_URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
-
-# Require this many consecutive confirmations before notifying (use 2 for production)
-CONFIRMATIONS = 2
-
-# State file
-LAST_STATE_FILE = "last_state.json"
-
-# Keywords
+# Keyword lists: HIGH keywords indicate Nordic availability, LOW keywords are generic and ignored alone
 HIGH_KEYWORDS = ["nordic", "danish", "danish layout", "iso nordic", "scandinavian"]
-LOW_KEYWORDS = ["iso", "ansi"]  # low-confidence; do not notify on these alone
+LOW_KEYWORDS = ["iso", "ansi"]
 
-# Whether the script should exit non-zero on unexpected errors (env)
+# Fail hard on notification errors if set in env
 FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
-# === end CONSTANTS ===
+# === end CONFIGURATION ===
 
 
 def make_session_with_retries(retries: int = 4, backoff_factor: float = 1.0, timeout: int = 20) -> requests.Session:
@@ -121,26 +122,26 @@ def try_product_json_endpoints(session: requests.Session, url: str) -> Tuple[Opt
 
 def _recursive_search_for_keywords(obj: Any) -> Tuple[Optional[str], Optional[str]]:
     """
-    Recursively search a JSON-like object for HIGH keywords (preferred) and
-    low keywords. Returns (high_match, low_match) where each is the matched keyword or None.
+    Recursively search JSON-like structure for HIGH and LOW keywords.
+    Returns (high_match, low_match) - first found occurrences.
     """
     high = None
     low = None
+
     if isinstance(obj, str):
         if not high:
             high = contains_high_keyword(obj)
         if not low:
             low = contains_low_keyword(obj)
         return high, low
+
     if isinstance(obj, dict):
         for k, v in obj.items():
-            # check keys
             if isinstance(k, str):
                 if not high:
                     high = contains_high_keyword(k)
                 if not low:
                     low = contains_low_keyword(k)
-            # recurse into value
             h, l = _recursive_search_for_keywords(v)
             if h and not high:
                 high = h
@@ -149,6 +150,7 @@ def _recursive_search_for_keywords(obj: Any) -> Tuple[Optional[str], Optional[st
             if high:
                 return high, low
         return high, low
+
     if isinstance(obj, list):
         for item in obj:
             h, l = _recursive_search_for_keywords(item)
@@ -159,6 +161,7 @@ def _recursive_search_for_keywords(obj: Any) -> Tuple[Optional[str], Optional[st
             if high:
                 return high, low
         return high, low
+
     return None, None
 
 
@@ -182,32 +185,89 @@ def parse_json_ld(soup) -> Tuple[Optional[Any], Optional[str]]:
     return None, None
 
 
+def _extract_json_objects_from_text(text: str) -> List[Any]:
+    """
+    Simple balanced-brace scanner that attempts to parse {...} JSON objects found in text.
+    It will succeed for embedded JSON (most common case). It is conservative and skips invalid JSON.
+    """
+    objs: List[Any] = []
+    if not text:
+        return objs
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != '{':
+            i += 1
+            continue
+        depth = 0
+        start = i
+        j = i
+        while j < n:
+            ch = text[j]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:j + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        objs.append(parsed)
+                        i = j + 1
+                        break
+                    except Exception:
+                        pass
+            j += 1
+        i = start + 1
+    return objs
+
+
+def inspect_inline_script_variants(soup) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Scan inline <script> tags for embedded JSON objects containing variant/option data.
+    Returns (high_match, low_match).
+    """
+    if soup is None:
+        return None, None
+
+    for script in soup.find_all("script"):
+        txt = script.string
+        if not txt or len(txt) < 50:
+            continue
+        lower = txt.lower()
+        if not any(k in lower for k in ("variant", "variants", "product", "option", "options")):
+            continue
+        for obj in _extract_json_objects_from_text(txt):
+            h, l = _recursive_search_for_keywords(obj)
+            if h:
+                return h, None
+            if l:
+                return None, l
+    return None, None
+
+
 def inspect_html_for_layouts(html_text: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Return (high_match, low_match).
-    high_match is a HIGH_KEYWORD found in a relevant context (option under a layout-like select, JSON-LD, label, etc).
-    low_match is a LOW_KEYWORD found (e.g. 'iso') but not accompanied by HIGH keyword.
-    We only treat HIGH as a true availability indicator.
+    Inspect the HTML for layout selectors and return (high_match, low_match).
+    high_match indicates explicit 'nordic'/'danish' etc in relevant context.
+    low_match indicates only 'iso'/'ansi' found.
     """
     if not html_text:
         return None, None
     if BeautifulSoup is None:
-        # fallback to plain text
+        # fallback to plain text search
         return contains_high_keyword(html_text), contains_low_keyword(html_text)
 
     soup = BeautifulSoup(html_text, "lxml")
 
-    # 1) Inspect selects/options — only consider options in selects that look like layout selectors
+    # 1) Inspect select elements that are contextually layout/variant selectors
     for select in soup.find_all("select"):
-        # derive a contextual label for the select
         select_label = (select.get("name") or select.get("id") or "")
-        # also check nearby text: previous headings or labels
         prev = select.find_previous(["label", "h2", "h3", "h4", "p", "span"])
         prev_text = (prev.get_text(" ", strip=True) if prev else "") or ""
         context = " ".join([select_label, prev_text]).lower()
 
-        # consider this select relevant if context mentions layout/keyboard/format/locale/etc
-        if any(kw in context for kw in ("layout", "keyboard", "format", "locale", "language", "variant")):
+        if any(k in context for k in ("layout", "keyboard", "format", "locale", "language", "variant", "type")):
             for option in select.find_all("option"):
                 text = (option.get_text(" ", strip=True) or "")
                 high = contains_high_keyword(text)
@@ -215,17 +275,16 @@ def inspect_html_for_layouts(html_text: str) -> Tuple[Optional[str], Optional[st
                     return high, None
                 low = contains_low_keyword(text)
                 if low:
-                    # record low but don't return as high
                     return None, low
 
-    # 2) Inspect radio/label groups similarly (check label text)
+    # 2) Labels/radio groups
     for label in soup.find_all("label"):
         text = (label.get_text(" ", strip=True) or "")
         high = contains_high_keyword(text)
         if high:
             return high, None
 
-    # 3) JSON-LD inside HTML
+    # 3) JSON-LD
     ld, src = parse_json_ld(soup)
     if ld:
         high, low = inspect_product_json(ld)
@@ -234,7 +293,14 @@ def inspect_html_for_layouts(html_text: str) -> Tuple[Optional[str], Optional[st
         if low:
             return None, low
 
-    # 4) Fallback: search the body for high keywords (less authoritative)
+    # 4) Inline scripts (variants embedded in JS)
+    inline_high, inline_low = inspect_inline_script_variants(soup)
+    if inline_high:
+        return inline_high, None
+    if inline_low:
+        return None, inline_low
+
+    # 5) Fallback: body text
     body_text = soup.get_text(" ", strip=True)[:200000]
     high = contains_high_keyword(body_text)
     if high:
@@ -248,8 +314,8 @@ def inspect_html_for_layouts(html_text: str) -> Tuple[Optional[str], Optional[st
 
 def detect_nordic_layout(session: requests.Session, url: str) -> Tuple[bool, str]:
     """
-    Returns (found, evidence) where found is True only when a HIGH_KEYWORD is detected
-    in an appropriate context (not merely 'ISO' alone).
+    Returns (found, evidence). found=True only when HIGH keyword is found in appropriate context.
+    LOW-only findings are logged but do not trigger found=True.
     """
     resp = safe_get(session, url)
     if resp is None:
@@ -262,19 +328,39 @@ def detect_nordic_layout(session: requests.Session, url: str) -> Tuple[bool, str
         if high:
             return True, f"{src}:high:{high}"
         if low:
-            # log low and continue to HTML parsing
             logging.info("%s low-confidence keyword in product JSON: %s", url, low)
 
-    # 2) JSON-LD and HTML parsing
+    # 2) Parse page HTML and JSON-LD
     html = resp.text
+    soup = None
+    if BeautifulSoup:
+        soup = BeautifulSoup(html, "lxml")
+
+    # JSON-LD check
+    ld, ld_src = parse_json_ld(soup) if soup is not None else (None, None)
+    if ld:
+        high, low = inspect_product_json(ld)
+        if high:
+            return True, f"{ld_src}:high:{high}"
+        if low:
+            logging.info("%s low-confidence keyword in JSON-LD: %s", url, low)
+
+    # 3) Inspect inline scripts (variants embedded in JS)
+    inline_high, inline_low = inspect_inline_script_variants(soup) if soup is not None else (None, None)
+    if inline_high:
+        return True, f"inline-script:high:{inline_high}"
+    if inline_low:
+        logging.info("%s low-confidence in inline scripts: %s", url, inline_low)
+
+    # 4) Inspect HTML selects/labels/body
     high, low = inspect_html_for_layouts(html)
     if high:
         return True, f"html:high:{high}"
     if low:
-        logging.info("%s low-confidence only (e.g. ISO present) - ignoring for notification: %s", url, low)
+        logging.info("%s low-confidence only (e.g. ISO/ANSI present) - ignoring for notification: %s", url, low)
         return False, f"html:low:{low}"
 
-    # 3) raw fallback
+    # 5) Raw fallback
     fk = contains_high_keyword(html)
     if fk:
         return True, f"raw_body:high:{fk}"
@@ -327,7 +413,6 @@ def run_check() -> int:
     found, evidence = detect_nordic_layout(session, PRODUCT_URL)
     logging.info("Checked %s -> found=%s evidence=%s", PRODUCT_URL, found, evidence)
 
-    # Load/update state
     state = load_last_state(LAST_STATE_FILE)
     prev_found = bool(state.get("found"))
     prev_consecutive = int(state.get("consecutive", 0))
@@ -338,7 +423,7 @@ def run_check() -> int:
         new_consecutive = 0
 
     notify = False
-    now = datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat()
 
     if found and new_consecutive >= CONFIRMATIONS and not prev_found:
         notify = True
