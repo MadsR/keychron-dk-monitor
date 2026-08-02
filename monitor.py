@@ -20,43 +20,30 @@ except Exception:
 import smtplib
 from email.message import EmailMessage
 
-# Configure logging early so parsing warnings are visible
+# Configure logging early
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Configuration from environment
+# Email config (still read from env)
 EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
-# Main product URL to check
-PRODUCT_URL = os.environ.get(
-    "PRODUCT_URL",
-    "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
-)
+# === CONSTANTS ===
+# Set the product URL you want to monitor here (constant, not env)
+PRODUCT_URL = "https://www.keychron.com/products/keychron-v1-qmk-custom-mechanical-keyboard-iso-layout-collection?variant=40283343487065"
 
-# Optional retailer pages (comma-separated)
-RETAILER_PAGES = [u.strip() for u in os.environ.get("RETAILER_PAGES", "").split(",") if u.strip()]
+# Set how many consecutive positive checks are required before notifying
+CONFIRMATIONS = 2
 
-# How many consecutive positive runs are required before sending a notification.
-# Parse CONFIRMATIONS defensively: treat missing/empty/non-int as default 2.
-_conf = os.environ.get("CONFIRMATIONS")
-try:
-    if _conf is None or str(_conf).strip() == "":
-        CONSECUTIVE_REQUIRED = 2
-    else:
-        CONSECUTIVE_REQUIRED = int(_conf)
-except Exception:
-    logging.warning("Invalid CONFIRMATIONS value %r; using default 2", _conf)
-    CONSECUTIVE_REQUIRED = 2
-
-# Whether the script should exit non-zero on unexpected errors
-FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
-
-# Last state file name
+# Last state file name (kept as env or constant)
 LAST_STATE_FILE = os.environ.get("LAST_STATE_FILE", "last_state.json")
 
 # Keywords to detect Nordic
 KEYWORDS = ["nordic", "danish", "iso nordic", "danish layout", "iso"]
+
+# Whether the script should exit non-zero on unexpected errors (still env-controlled)
+FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
+# === end CONSTANTS ===
 
 
 def make_session_with_retries(retries: int = 4, backoff_factor: float = 1.0, timeout: int = 20) -> requests.Session:
@@ -67,7 +54,7 @@ def make_session_with_retries(retries: int = 4, backoff_factor: float = 1.0, tim
         read=retries,
         status=retries,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "GET"],
         backoff_factor=backoff_factor,
         raise_on_status=False,
     )
@@ -167,6 +154,7 @@ def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[st
         return _search_keywords_in_text(html_text, keywords)
     soup = BeautifulSoup(html_text, "lxml")
 
+    # 1) Check select/options
     for select in soup.find_all("select"):
         name = (select.get("name") or select.get("id") or "").lower()
         if "layout" in name or "keyboard" in name or "variant" in name or "option" in name:
@@ -175,17 +163,20 @@ def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[st
                 if text and _search_keywords_in_text(text, keywords):
                     return f"select:{name}:{text}"
 
+    # 2) Labels/radios
     for label in soup.find_all("label"):
         text = (label.get_text(" ", strip=True) or "")
         if text and _search_keywords_in_text(text, keywords):
             return f"label:{text[:100]}"
 
+    # 3) JSON-LD
     ld, src = parse_json_ld(soup)
     if ld:
         fk = inspect_product_json(ld, keywords)
         if fk:
             return f"{src}:{fk}"
 
+    # 4) body text fallback
     page_text = soup.get_text(" ", strip=True)[:200000]
     fk = _search_keywords_in_text(page_text, keywords)
     if fk:
@@ -269,12 +260,17 @@ def send_mail(subject: str, body: str) -> bool:
 
 def run_check() -> int:
     session = make_session_with_retries()
-    urls_to_check = [PRODUCT_URL] + RETAILER_PAGES
+    urls_to_check = [PRODUCT_URL]  # constants only; retailer pages can be added in the file if desired
 
     overall_found = False
     evidence_items: List[str] = []
 
+    # Skip empty urls defensively
     for u in urls_to_check:
+        if not u or str(u).strip() == "":
+            logging.debug("Skipping empty URL entry")
+            continue
+
         found, evidence = detect_nordic_layout(session, u, KEYWORDS)
         logging.info("Checked %s -> found=%s evidence=%s", u, found, evidence)
         if found:
@@ -295,9 +291,9 @@ def run_check() -> int:
     body = ""
     now = datetime.utcnow().isoformat() + "Z"
 
-    if overall_found and new_consecutive >= CONSECUTIVE_REQUIRED and not prev_found:
+    if overall_found and new_consecutive >= CONFIRMATIONS and not prev_found:
         notify = True
-        subject = "Keychron K5 Ultra — Nordic layout detected"
+        subject = "Keychron — Nordic layout detected"
         body = f"Detected Nordic/Danish layout on {PRODUCT_URL}\n\nEvidence:\n" + "\n".join(evidence_items) + f"\n\nConfirmed {new_consecutive} consecutive times.\n\nTime: {now}"
         state["found"] = True
         state["consecutive"] = new_consecutive
@@ -305,7 +301,7 @@ def run_check() -> int:
         state["updated_at"] = now
     elif not overall_found and prev_found:
         notify = True
-        subject = "Keychron K5 Ultra — Nordic layout no longer detected"
+        subject = "Keychron — Nordic layout no longer detected"
         body = f"Previously-detected Nordic layout is no longer present on {PRODUCT_URL}\n\nChecked pages and found no evidence.\n\nTime: {now}"
         state["found"] = False
         state["consecutive"] = 0
