@@ -38,7 +38,16 @@ RETAILER_PAGES = [
 ]
 
 # How many consecutive positive runs are required before sending a notification
-CONSECUTIVE_REQUIRED = int(os.environ.get("CONFIRMATIONS", "2"))
+# Robustly parse CONFIRMATIONS - it may be unset or an empty string from workflow secrets
+_conf = os.environ.get("CONFIRMATIONS")
+try:
+    if _conf is None or str(_conf).strip() == "":
+        CONSECUTIVE_REQUIRED = 2
+    else:
+        CONSECUTIVE_REQUIRED = int(_conf)
+except ValueError:
+    logging.warning("Invalid CONFIRMATIONS value %r; using default 2", _conf)
+    CONSECUTIVE_REQUIRED = 2
 
 # Whether the script should exit non-zero on unexpected errors
 FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
@@ -361,3 +370,4 @@ if __name__ == "__main__":
             sys.exit(1)
         else:
             sys.exit(0)
+
