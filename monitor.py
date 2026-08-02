@@ -20,7 +20,7 @@ except Exception:
 import smtplib
 from email.message import EmailMessage
 
-# Configure logging early
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Email config (from env)
@@ -29,19 +29,19 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
 # === CONSTANTS ===
-# Monitor the K5 Ultra product URL
 PRODUCT_URL = "https://www.keychron.com/products/keychron-k5-ultra-8k-wireless-custom-mechanical-keyboard"
 
-# How many consecutive positive checks are required before notifying (set to 1 for immediate testing)
-CONFIRMATIONS = 1
+# Require this many consecutive confirmations before notifying (use 2 for production)
+CONFIRMATIONS = 2
 
-# Last state file name
+# State file
 LAST_STATE_FILE = "last_state.json"
 
-# Keywords to detect Nordic
-KEYWORDS = ["nordic", "danish", "iso nordic", "danish layout", "iso"]
+# Keywords
+HIGH_KEYWORDS = ["nordic", "danish", "danish layout", "iso nordic", "scandinavian"]
+LOW_KEYWORDS = ["iso", "ansi"]  # low-confidence; do not notify on these alone
 
-# Whether the script should exit non-zero on unexpected errors (env-controlled)
+# Whether the script should exit non-zero on unexpected errors (env)
 FAIL_ON_ERROR = os.environ.get("FAIL_ON_ERROR", "0") == "1"
 # === end CONSTANTS ===
 
@@ -83,10 +83,22 @@ def safe_get(session: requests.Session, url: str) -> Optional[requests.Response]
         return None
 
 
-def _search_keywords_in_text(text: str, keywords: List[str]) -> Optional[str]:
-    ltext = text.lower()
-    for kw in keywords:
-        if kw in ltext:
+def contains_high_keyword(text: str) -> Optional[str]:
+    if not text:
+        return None
+    l = text.lower()
+    for kw in HIGH_KEYWORDS:
+        if kw in l:
+            return kw
+    return None
+
+
+def contains_low_keyword(text: str) -> Optional[str]:
+    if not text:
+        return None
+    l = text.lower()
+    for kw in LOW_KEYWORDS:
+        if kw in l:
             return kw
     return None
 
@@ -107,30 +119,53 @@ def try_product_json_endpoints(session: requests.Session, url: str) -> Tuple[Opt
     return None, None
 
 
-def _recursive_search_for_keywords(obj: Any, keywords: List[str]) -> Optional[str]:
+def _recursive_search_for_keywords(obj: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Recursively search a JSON-like object for HIGH keywords (preferred) and
+    low keywords. Returns (high_match, low_match) where each is the matched keyword or None.
+    """
+    high = None
+    low = None
     if isinstance(obj, str):
-        return _search_keywords_in_text(obj, keywords)
+        if not high:
+            high = contains_high_keyword(obj)
+        if not low:
+            low = contains_low_keyword(obj)
+        return high, low
     if isinstance(obj, dict):
         for k, v in obj.items():
+            # check keys
             if isinstance(k, str):
-                fk = _search_keywords_in_text(k, keywords)
-                if fk:
-                    return fk
-            res = _recursive_search_for_keywords(v, keywords)
-            if res:
-                return res
+                if not high:
+                    high = contains_high_keyword(k)
+                if not low:
+                    low = contains_low_keyword(k)
+            # recurse into value
+            h, l = _recursive_search_for_keywords(v)
+            if h and not high:
+                high = h
+            if l and not low:
+                low = l
+            if high:
+                return high, low
+        return high, low
     if isinstance(obj, list):
         for item in obj:
-            res = _recursive_search_for_keywords(item, keywords)
-            if res:
-                return res
-    return None
+            h, l = _recursive_search_for_keywords(item)
+            if h and not high:
+                high = h
+            if l and not low:
+                low = l
+            if high:
+                return high, low
+        return high, low
+    return None, None
 
 
-def inspect_product_json(payload: Any, keywords: List[str]) -> Optional[str]:
+def inspect_product_json(payload: Any) -> Tuple[Optional[str], Optional[str]]:
     if not payload:
-        return None
-    return _recursive_search_for_keywords(payload, keywords)
+        return None, None
+    return _recursive_search_for_keywords(payload)
 
 
 def parse_json_ld(soup) -> Tuple[Optional[Any], Optional[str]]:
@@ -147,70 +182,102 @@ def parse_json_ld(soup) -> Tuple[Optional[Any], Optional[str]]:
     return None, None
 
 
-def inspect_html_for_layouts(html_text: str, keywords: List[str]) -> Optional[str]:
+def inspect_html_for_layouts(html_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (high_match, low_match).
+    high_match is a HIGH_KEYWORD found in a relevant context (option under a layout-like select, JSON-LD, label, etc).
+    low_match is a LOW_KEYWORD found (e.g. 'iso') but not accompanied by HIGH keyword.
+    We only treat HIGH as a true availability indicator.
+    """
     if not html_text:
-        return None
+        return None, None
     if BeautifulSoup is None:
-        return _search_keywords_in_text(html_text, keywords)
+        # fallback to plain text
+        return contains_high_keyword(html_text), contains_low_keyword(html_text)
+
     soup = BeautifulSoup(html_text, "lxml")
 
+    # 1) Inspect selects/options — only consider options in selects that look like layout selectors
     for select in soup.find_all("select"):
-        name = (select.get("name") or select.get("id") or "").lower()
-        if "layout" in name or "keyboard" in name or "variant" in name or "option" in name:
-            for option in select.find_all("option"):
-                text = (option.text or "").strip()
-                if text and _search_keywords_in_text(text, keywords):
-                    return f"select:{name}:{text}"
+        # derive a contextual label for the select
+        select_label = (select.get("name") or select.get("id") or "")
+        # also check nearby text: previous headings or labels
+        prev = select.find_previous(["label", "h2", "h3", "h4", "p", "span"])
+        prev_text = (prev.get_text(" ", strip=True) if prev else "") or ""
+        context = " ".join([select_label, prev_text]).lower()
 
+        # consider this select relevant if context mentions layout/keyboard/format/locale/etc
+        if any(kw in context for kw in ("layout", "keyboard", "format", "locale", "language", "variant")):
+            for option in select.find_all("option"):
+                text = (option.get_text(" ", strip=True) or "")
+                high = contains_high_keyword(text)
+                if high:
+                    return high, None
+                low = contains_low_keyword(text)
+                if low:
+                    # record low but don't return as high
+                    return None, low
+
+    # 2) Inspect radio/label groups similarly (check label text)
     for label in soup.find_all("label"):
         text = (label.get_text(" ", strip=True) or "")
-        if text and _search_keywords_in_text(text, keywords):
-            return f"label:{text[:100]}"
+        high = contains_high_keyword(text)
+        if high:
+            return high, None
 
+    # 3) JSON-LD inside HTML
     ld, src = parse_json_ld(soup)
     if ld:
-        fk = inspect_product_json(ld, keywords)
-        if fk:
-            return f"{src}:{fk}"
+        high, low = inspect_product_json(ld)
+        if high:
+            return high, low
+        if low:
+            return None, low
 
-    page_text = soup.get_text(" ", strip=True)[:200000]
-    fk = _search_keywords_in_text(page_text, keywords)
-    if fk:
-        return f"body:{fk}"
+    # 4) Fallback: search the body for high keywords (less authoritative)
+    body_text = soup.get_text(" ", strip=True)[:200000]
+    high = contains_high_keyword(body_text)
+    if high:
+        return high, None
+    low = contains_low_keyword(body_text)
+    if low:
+        return None, low
 
-    return None
+    return None, None
 
 
-def detect_nordic_layout(session: requests.Session, url: str, keywords: List[str]) -> Tuple[bool, str]:
+def detect_nordic_layout(session: requests.Session, url: str) -> Tuple[bool, str]:
+    """
+    Returns (found, evidence) where found is True only when a HIGH_KEYWORD is detected
+    in an appropriate context (not merely 'ISO' alone).
+    """
     resp = safe_get(session, url)
     if resp is None:
         return False, f"fetch-failed:{url}"
 
+    # 1) product JSON endpoints
     payload, src = try_product_json_endpoints(session, url)
     if payload:
-        match = inspect_product_json(payload, keywords)
-        if match:
-            return True, f"{src}:{match}"
+        high, low = inspect_product_json(payload)
+        if high:
+            return True, f"{src}:high:{high}"
+        if low:
+            # log low and continue to HTML parsing
+            logging.info("%s low-confidence keyword in product JSON: %s", url, low)
 
+    # 2) JSON-LD and HTML parsing
     html = resp.text
-    if BeautifulSoup:
-        soup = BeautifulSoup(html, "lxml")
-    else:
-        soup = None
+    high, low = inspect_html_for_layouts(html)
+    if high:
+        return True, f"html:high:{high}"
+    if low:
+        logging.info("%s low-confidence only (e.g. ISO present) - ignoring for notification: %s", url, low)
+        return False, f"html:low:{low}"
 
-    ld, ld_src = parse_json_ld(soup)
-    if ld:
-        match = inspect_product_json(ld, keywords)
-        if match:
-            return True, f"{ld_src}:{match}"
-
-    match = inspect_html_for_layouts(html, keywords)
-    if match:
-        return True, f"html:{match}"
-
-    fk = _search_keywords_in_text(html, keywords)
+    # 3) raw fallback
+    fk = contains_high_keyword(html)
     if fk:
-        return True, f"raw_body:{fk}"
+        return True, f"raw_body:high:{fk}"
 
     return False, "no-evidence"
 
@@ -257,55 +324,41 @@ def send_mail(subject: str, body: str) -> bool:
 
 def run_check() -> int:
     session = make_session_with_retries()
-    urls_to_check = [PRODUCT_URL]
+    found, evidence = detect_nordic_layout(session, PRODUCT_URL)
+    logging.info("Checked %s -> found=%s evidence=%s", PRODUCT_URL, found, evidence)
 
-    overall_found = False
-    evidence_items: List[str] = []
-
-    for u in urls_to_check:
-        if not u or str(u).strip() == "":
-            logging.debug("Skipping empty URL entry")
-            continue
-
-        found, evidence = detect_nordic_layout(session, u, KEYWORDS)
-        logging.info("Checked %s -> found=%s evidence=%s", u, found, evidence)
-        if found:
-            overall_found = True
-            evidence_items.append(f"{u} -> {evidence}")
-
+    # Load/update state
     state = load_last_state(LAST_STATE_FILE)
     prev_found = bool(state.get("found"))
     prev_consecutive = int(state.get("consecutive", 0))
 
-    if overall_found:
+    if found:
         new_consecutive = prev_consecutive + 1
     else:
         new_consecutive = 0
 
     notify = False
-    subject = ""
-    body = ""
     now = datetime.utcnow().isoformat() + "Z"
 
-    if overall_found and new_consecutive >= CONFIRMATIONS and not prev_found:
+    if found and new_consecutive >= CONFIRMATIONS and not prev_found:
         notify = True
         subject = "Keychron K5 Ultra — Nordic layout detected"
-        body = f"Detected Nordic/Danish layout on {PRODUCT_URL}\n\nEvidence:\n" + "\n".join(evidence_items) + f"\n\nConfirmed {new_consecutive} consecutive times.\n\nTime: {now}"
+        body = f"Detected Nordic/Danish layout on {PRODUCT_URL}\n\nEvidence:\n{evidence}\n\nConfirmed {new_consecutive} consecutive times.\n\nTime: {now}"
         state["found"] = True
         state["consecutive"] = new_consecutive
-        state["evidence"] = evidence_items
+        state["evidence"] = [evidence]
         state["updated_at"] = now
-    elif not overall_found and prev_found:
+    elif not found and prev_found:
         notify = True
         subject = "Keychron K5 Ultra — Nordic layout no longer detected"
-        body = f"Previously-detected Nordic layout is no longer present on {PRODUCT_URL}\n\nChecked pages and found no evidence.\n\nTime: {now}"
+        body = f"Previously-detected Nordic layout is no longer present on {PRODUCT_URL}\n\nTime: {now}"
         state["found"] = False
         state["consecutive"] = 0
-        state["evidence"] = evidence_items
+        state["evidence"] = []
         state["updated_at"] = now
     else:
         state["consecutive"] = new_consecutive
-        state["evidence"] = evidence_items
+        state["evidence"] = state.get("evidence", [])
         state["updated_at"] = now
 
     save_last_state(LAST_STATE_FILE, state)
